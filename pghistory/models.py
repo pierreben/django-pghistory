@@ -5,6 +5,7 @@ import uuid
 
 import django
 from django.apps import apps
+from django.core.exceptions import FieldDoesNotExist
 from django.db import connection
 from django.db import connections
 from django.db import models
@@ -198,9 +199,7 @@ def create_event_model(
         meta (dict, default=None): Additional options to add to the model
             Meta
     """
-    related_name = related_name or _generate_related_name(
-        base_class, tracked_model, fields
-    )
+    related_name = related_name or _generate_related_name(base_class, tracked_model, fields)
     name = name or _generate_event_model_name(base_class, tracked_model, fields)
     app_label = app_label or tracked_model._meta.app_label
     _validate_event_model_path(app_label=app_label, name=name, abstract=abstract)
@@ -238,15 +237,11 @@ def create_event_model(
         for field in parent._meta.fields:
             exclude.append(field.name)
 
-    fields = fields or [
-        f.name for f in tracked_model._meta.fields if f.name not in exclude
-    ]
+    fields = fields or [f.name for f in tracked_model._meta.fields if f.name not in exclude]
 
     class_attrs = {
         "__module__": models_module,
-        "Meta": type(
-            "Meta", (), {"abstract": abstract, "app_label": app_label, **meta}
-        ),
+        "Meta": type("Meta", (), {"abstract": abstract, "app_label": app_label, **meta}),
         "pgh_tracked_model": tracked_model,
         **{field: _generate_history_field(tracked_model, field) for field in fields},
         **attrs,
@@ -277,6 +272,35 @@ def _pascalcase(string):
         lambda matched: matched.group(1).upper(),
         string[1:],
     )
+
+
+def get_cls_related_event_models(cls):
+    """
+    For a given model-class, returns the related event models pointing at it
+
+    Excludes from this list the event models of this class children if any.
+    """
+
+    all_event_models = [
+        model
+        for model in apps.get_models()
+        if issubclass(model, Event)
+        and not issubclass(model, BaseAggregateEvent)
+        and (any(getattr(field, "related_model", None) == cls for field in model._meta.fields))
+    ]
+
+    event_models = []
+    for event_model in all_event_models:
+        try:
+            related_cls = event_model._meta.get_field("pgh_obj").related_model
+            if cls in related_cls._meta.parents:
+                continue
+        except FieldDoesNotExist:
+            pass
+
+        event_models.append(event_model)
+
+    return event_models
 
 
 class Event(models.Model):
@@ -342,9 +366,7 @@ class AggregateEventQueryCompiler(SQLCompiler):
         schema of the AggregateEvent table. Note that it's impossible to
         create an empty CTE, so we select NULL VALUES and LIMIT to 0.
         """
-        col_name_clause = ", ".join(
-            [field.column for field in self.query.model._meta.fields]
-        )
+        col_name_clause = ", ".join([field.column for field in self.query.model._meta.fields])
         col_select_clause = ",\n".join(
             [
                 f"_pgh_obj_event.{field.column}::"
@@ -369,7 +391,7 @@ class AggregateEventQueryCompiler(SQLCompiler):
             return obj[0].__class__
         return obj.__class__
 
-    def _get_aggregate_event_select(self, obj, event_model):
+    def _get_aggregate_event_select(self, obj, event_model):  # noqa: C901
         cls = self._class_for_target(obj)
         related_fields = [
             field.column
@@ -377,14 +399,49 @@ class AggregateEventQueryCompiler(SQLCompiler):
             if getattr(field, "related_model", None) == cls
         ]
 
+        """
+            Special case to add cls parents event models
+            Handle this kind of relations:
+
+            ParentModel ⟵ ParentModelRelatedModel
+                ↑
+            ChildModel ⟵ ChildModelRelatedModel
+
+        """
         if not related_fields:
             for parent in cls._meta.parents:
                 for field in parent._meta.get_fields():
                     related_model = getattr(field, "related_model", None)
 
+                    # If we identify the field that links the ParentModel and the event_model,
+                    # we add the field column to the related_fields to link
                     if related_model == event_model:
                         related_fields.append(field.field.column)
                         break
+
+        if not related_fields:
+            # If no related field was found yet,
+            # we can be in the case of an event_model linked
+            # to a ParentModel of our original cls (i.e: ParentModelRelatedModel).
+            #
+            # In this case,
+            # we must "recursively" identify the field in our event_model that
+            # links the parent model or one of its parents.
+            cls_parents = list(cls._meta.parents)
+            while len(cls_parents) > 0:
+                parent = cls_parents.pop()
+
+                for field in event_model._meta.get_fields():
+                    related_model = getattr(field, "related_model", None)
+                    if related_model == parent:
+                        related_fields.append(field.column)
+                        break
+
+                if related_fields:
+                    break
+
+                for parent_parent in parent._meta.parents:
+                    cls_parents.append(parent_parent)
 
         if not related_fields:
             raise ValueError(f"Event model {event_model} does not reference {cls}")
@@ -397,9 +454,7 @@ class AggregateEventQueryCompiler(SQLCompiler):
         else:
             opt = "="
             pks = f"'{obj.pk}'"
-        where_filter = " OR ".join(
-            f"_event.{col} {opt} {pks}" for col in related_fields
-        )
+        where_filter = " OR ".join(f"_event.{col} {opt} {pks}" for col in related_fields)
 
         context_join_clause = ""
         final_context_columns_clause = "".join(
@@ -505,43 +560,32 @@ class AggregateEventQueryCompiler(SQLCompiler):
         """
         obj = self.query.target
         if not obj:
-            raise ValueError(
-                "Must use .target() to target an object for event aggregation"
-            )
+            raise ValueError("Must use .target() to target an object for event aggregation")
 
         event_models = self.query.across
         cls = self._class_for_target(obj)
         if not event_models:
-            event_models = [
-                model
-                for model in apps.get_models()
-                if issubclass(model, Event)
-                and not issubclass(model, BaseAggregateEvent)
-                and (
-                    any(
-                        getattr(field, "related_model", None) == cls
-                        for field in model._meta.fields
-                    )
-                )
-            ]
+            event_models = get_cls_related_event_models(cls)
 
-            for parent in cls._meta.parents:
-                for field in parent._meta.get_fields():
-                    related_model = getattr(field, "related_model", None)
+            # Special case to "recursively" extract parents event_models,
+            # calling the get_cls_related_event_models on each parent and their parents
+            related_event_parents = event_models.copy()
+            while len(related_event_parents) > 0:
+                related_event = related_event_parents.pop()
+                try:
+                    related_cls = related_event._meta.get_field("pgh_obj").related_model
 
-                    if (
-                        related_model
-                        and issubclass(related_model, Event)
-                        and not issubclass(related_model, BaseAggregateEvent)
-                    ):
-                        event_models.append(related_model)
+                    for parent in related_cls._meta.parents:
+                        parent_event_models = get_cls_related_event_models(parent)
+                        event_models += parent_event_models
+                        related_event_parents += parent_event_models
+
+                except FieldDoesNotExist:
+                    pass
 
         agg_event_table = self.query.model._meta.db_table
         inner_cte = "UNION ALL ".join(
-            [
-                self._get_aggregate_event_select(obj, event_model)
-                for event_model in event_models
-            ]
+            [self._get_aggregate_event_select(obj, event_model) for event_model in event_models]
         )
         if not inner_cte:
             inner_cte = self._get_empty_aggregate_event_select()
