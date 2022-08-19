@@ -62,7 +62,7 @@ else
 endif
 
 
-# Ensure we are logged into the Gitlab docker registry and start a detached container
+# Pull the latest container and start a detached run
 .PHONY: docker-start
 docker-start:
 	$(DOCKER_CMD) pull opus10/circleci-public-django-app
@@ -93,16 +93,11 @@ setup: teardown docker-start lock dependencies
 shell:
 	$(DOCKER_EXEC_WRAPPER) /bin/bash
 
-# Run test folder migrations generation
-.PHONY: migrations
-migrations:
-	$(DOCKER_EXEC_WRAPPER) poetry run python manage.py makemigrations
-
 
 # Run pytest
 .PHONY: test
 test:
-	$(DOCKER_EXEC_WRAPPER) pytest -s
+	$(DOCKER_EXEC_WRAPPER) pytest
 
 
 # Run full test suite
