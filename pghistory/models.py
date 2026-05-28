@@ -86,6 +86,23 @@ def _generate_event_model_name(base_model, tracked_model, fields):
     return _pascalcase(name)
 
 
+def _invalidate_related_field_caches(remote_field):
+    """
+    ``copy.deepcopy`` copies cached_property values from the source field's
+    ``remote_field`` (e.g. ``hidden=False`` when ``related_name`` was
+    ``"communities"``). After forcing ``related_name="+"``, those caches must
+    be cleared or Django 5.x still treats the relation as visible (E304/E305).
+    """
+    for cached_attr in (
+        "hidden",
+        "accessor_name",
+        "cache_name",
+        "name",
+        "path_infos",
+    ):
+        remote_field.__dict__.pop(cached_attr, None)
+
+
 def _generate_history_field(tracked_model, field):
     """
     When generating a history model from a tracked model, ensure the fields
@@ -102,8 +119,11 @@ def _generate_history_field(tracked_model, field):
     if isinstance(field, RelatedField):
         field.db_constraint = False
         field.remote_field.on_delete = models.DO_NOTHING
+        field._related_name = "+"
+        field._related_query_name = "+"
         field.remote_field.related_name = "+"
         field.remote_field.related_query_name = "+"
+        _invalidate_related_field_caches(field.remote_field)
     else:
         field.db_index = False
 
@@ -400,7 +420,7 @@ class AggregateEventQueryCompiler(SQLCompiler):
             SELECT
               {col_select_clause}
             FROM (
-              VALUES ({', '.join(values_list)}) LIMIT 0
+              VALUES ({", ".join(values_list)}) LIMIT 0
             ) AS _pgh_obj_event({col_name_clause})
             WHERE pgh_table IS NOT NULL
         """
@@ -512,8 +532,7 @@ class AggregateEventQueryCompiler(SQLCompiler):
             # make them null since there is no context on this event
             annotated_context_columns_clause = "".join(
                 [
-                    f"NULL::{field.rel_db_type(self.connection)}"
-                    f" AS {field.attname},\n"
+                    f"NULL::{field.rel_db_type(self.connection)} AS {field.attname},\n"
                     for field in self.query.model._meta.fields
                     if not field.attname.startswith("pgh_")
                 ]
@@ -753,4 +772,3 @@ class AggregateEvent(BaseAggregateEvent):
 
     class Meta:
         managed = False
-
